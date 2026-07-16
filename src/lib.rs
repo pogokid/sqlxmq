@@ -455,6 +455,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn it_can_spawn_batch_of_jobs() {
+        {
+            let pool = &*test_pool().await;
+            let (tx, mut rx) = mpsc::unbounded();
+
+            let (_runner, counter) = test_job_runner(pool, move |mut job| {
+                let tx = tx.clone();
+                async move {
+                    let payload: Option<String> = job.json().unwrap();
+                    tx.unbounded_send((job.name().to_owned(), payload)).unwrap();
+                    job.complete().await.unwrap();
+                }
+            })
+            .await;
+
+            let mut job_a = JobBuilder::new("a");
+            job_a.set_json(&"first").unwrap();
+            let mut job_b = JobBuilder::new("b");
+            job_b.set_json(&"second").unwrap();
+            let job_c = JobBuilder::new("c");
+
+            let ids = spawn_batch(pool, &[job_a, job_b, job_c]).await.unwrap();
+            assert_eq!(ids.len(), 3);
+
+            pause().await;
+            assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                received.push(rx.next().await.unwrap());
+            }
+            received.sort();
+            assert_eq!(
+                received,
+                vec![
+                    ("a".to_owned(), Some("first".to_owned())),
+                    ("b".to_owned(), Some("second".to_owned())),
+                    ("c".to_owned(), None),
+                ]
+            );
+        }
+        pause().await;
+    }
+
+    #[tokio::test]
+    async fn it_chains_ordered_jobs_spawned_in_batch() {
+        {
+            let pool = &*test_pool().await;
+            let (tx, mut rx) = mpsc::unbounded();
+
+            let (_runner, counter) = test_job_runner(pool, move |job| {
+                let tx = tx.clone();
+                async move {
+                    tx.unbounded_send(job).unwrap();
+                }
+            })
+            .await;
+
+            let mut job_a = JobBuilder::new("a");
+            job_a.set_ordered(true);
+            let mut job_b = JobBuilder::new("b");
+            job_b.set_ordered(true);
+
+            spawn_batch(pool, &[job_a, job_b]).await.unwrap();
+
+            // Only the first job in the chain should be delivered.
+            pause().await;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            let mut job = rx.next().await.unwrap();
+            job.complete().await.unwrap();
+
+            pause().await;
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+        pause().await;
+    }
+
+    #[tokio::test]
     async fn it_runs_jobs_in_order() {
         {
             let pool = &*test_pool().await;
