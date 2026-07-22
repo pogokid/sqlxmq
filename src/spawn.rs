@@ -141,7 +141,7 @@ impl<'a> JobBuilder<'a> {
 ///
 /// This is more efficient than calling [`JobBuilder::spawn`] repeatedly, and
 /// when the jobs are ordered and share a channel, guarantees they are chained
-/// in a single atomic operation.
+/// atomically, in the order they appear in `builders`.
 ///
 /// Returns the IDs of the spawned jobs in the same order as `builders`.
 pub async fn spawn_batch<'b, E: sqlx::Executor<'b, Database = Postgres>>(

@@ -517,18 +517,23 @@ mod tests {
             job_a.set_ordered(true);
             let mut job_b = JobBuilder::new("b");
             job_b.set_ordered(true);
+            let mut job_c = JobBuilder::new("c");
+            job_c.set_ordered(true);
 
-            spawn_batch(pool, &[job_a, job_b]).await.unwrap();
+            spawn_batch(pool, &[job_a, job_b, job_c]).await.unwrap();
 
-            // Only the first job in the chain should be delivered.
+            // Only the first job in the chain should be delivered, and jobs
+            // must be delivered in the order they appeared in the batch.
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-            let mut job = rx.next().await.unwrap();
-            job.complete().await.unwrap();
-
-            pause().await;
-            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            for (i, &expected_name) in ["a", "b", "c"].iter().enumerate() {
+                let mut job = rx.next().await.unwrap();
+                assert_eq!(job.name(), expected_name);
+                job.complete().await.unwrap();
+                pause().await;
+                assert_eq!(counter.load(Ordering::SeqCst), (i + 2).min(3));
+            }
         }
         pause().await;
     }
