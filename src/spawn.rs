@@ -137,6 +137,70 @@ impl<'a> JobBuilder<'a> {
     }
 }
 
+/// Spawn a batch of jobs in a single database query.
+///
+/// This is more efficient than calling [`JobBuilder::spawn`] repeatedly, and
+/// when the jobs are ordered and share a channel, guarantees they are chained
+/// atomically, in the order they appear in `builders`.
+///
+/// Returns the IDs of the spawned jobs in the same order as `builders`.
+pub async fn spawn_batch<'b, E: sqlx::Executor<'b, Database = Postgres>>(
+    executor: E,
+    builders: &[JobBuilder<'_>],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    if builders.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::with_capacity(builders.len());
+    let mut delays = Vec::with_capacity(builders.len());
+    let mut retries = Vec::with_capacity(builders.len());
+    let mut retry_backoffs = Vec::with_capacity(builders.len());
+    let mut channel_names = Vec::with_capacity(builders.len());
+    let mut channel_args = Vec::with_capacity(builders.len());
+    let mut commit_intervals = Vec::with_capacity(builders.len());
+    let mut ordereds = Vec::with_capacity(builders.len());
+    let mut names = Vec::with_capacity(builders.len());
+    let mut payloads_json = Vec::with_capacity(builders.len());
+    let mut payloads_bytes = Vec::with_capacity(builders.len());
+    for builder in builders {
+        ids.push(builder.id);
+        delays.push(builder.delay);
+        retries.push(builder.retries as i32);
+        retry_backoffs.push(builder.retry_backoff);
+        channel_names.push(builder.channel_name);
+        channel_args.push(builder.channel_args);
+        commit_intervals.push(builder.commit_interval);
+        ordereds.push(builder.ordered);
+        names.push(builder.name);
+        payloads_json.push(builder.payload_json.as_deref());
+        payloads_bytes.push(builder.payload_bytes);
+    }
+
+    sqlx::query(
+        "SELECT mq_insert(ARRAY(
+            SELECT (id, delay, retries, retry_backoff, channel_name, channel_args, commit_interval, ordered, name, payload_json, payload_bytes)::mq_new_t
+            FROM UNNEST($1::UUID[], $2::INTERVAL[], $3::INT[], $4::INTERVAL[], $5::TEXT[], $6::TEXT[], $7::INTERVAL[], $8::BOOLEAN[], $9::TEXT[], $10::TEXT[], $11::BYTEA[])
+            WITH ORDINALITY AS t(id, delay, retries, retry_backoff, channel_name, channel_args, commit_interval, ordered, name, payload_json, payload_bytes, ord)
+            ORDER BY ord
+        ))",
+    )
+    .bind(ids.clone())
+    .bind(delays)
+    .bind(retries)
+    .bind(retry_backoffs)
+    .bind(channel_names)
+    .bind(channel_args)
+    .bind(commit_intervals)
+    .bind(ordereds)
+    .bind(names)
+    .bind(payloads_json)
+    .bind(payloads_bytes)
+    .execute(executor)
+    .await?;
+    Ok(ids)
+}
+
 /// Commit the specified jobs. The jobs should have been previously spawned
 /// with the two-phase commit option enabled.
 pub async fn commit<'b, E: sqlx::Executor<'b, Database = Postgres>>(

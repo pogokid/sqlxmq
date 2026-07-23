@@ -1,4 +1,4 @@
-use std::any::type_name;
+use std::any::{type_name, Any, TypeId};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
@@ -6,8 +6,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anymap2::any::CloneAnySendSync;
-use anymap2::Map;
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
@@ -23,7 +21,7 @@ pub struct JobRegistry {
     #[allow(clippy::type_complexity)]
     error_handler: Arc<dyn Fn(&str, BoxedError) + Send + Sync>,
     job_map: HashMap<&'static str, &'static NamedJob>,
-    context: Map<dyn CloneAnySendSync + Send + Sync>,
+    context: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 /// Error returned when a job is received whose name is not in the registry.
@@ -49,7 +47,7 @@ impl JobRegistry {
         Self {
             error_handler: Arc::new(Self::default_error_handler),
             job_map,
-            context: Map::new(),
+            context: HashMap::new(),
         }
     }
 
@@ -64,13 +62,17 @@ impl JobRegistry {
 
     /// Provide context for the jobs.
     pub fn set_context<C: Clone + Send + Sync + 'static>(&mut self, context: C) -> &mut Self {
-        self.context.insert(context);
+        self.context.insert(TypeId::of::<C>(), Box::new(context));
         self
     }
 
     /// Access job context. Will panic if context with this type has not been provided.
     pub fn context<C: Clone + Send + Sync + 'static>(&self) -> C {
-        if let Some(c) = self.context.get::<C>() {
+        if let Some(c) = self
+            .context
+            .get(&TypeId::of::<C>())
+            .and_then(|c| c.downcast_ref::<C>())
+        {
             c.clone()
         } else {
             panic!(
