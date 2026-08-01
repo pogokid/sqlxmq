@@ -397,6 +397,7 @@ mod tests {
     use sqlx::{Pool, Postgres};
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::task;
+    use uuid::Uuid;
 
     // field 0 is never read, but its drop is important
     #[allow(dead_code)]
@@ -818,5 +819,183 @@ mod tests {
             pause().await;
         }
         pause().await;
+    }
+
+    /// `mq_poll` claims candidate rows with `FOR UPDATE SKIP LOCKED`, so a
+    /// poller must never block on, or hand back, rows another poller has
+    /// already claimed.
+    ///
+    /// Both polls run inside explicit transactions: row locks are held until
+    /// the transaction ends, so the second poll genuinely contends with the
+    /// first. Without `SKIP LOCKED` the second poll blocks on the first
+    /// transaction's row locks and this test times out; without the
+    /// `MATERIALIZED` CTE the locking subquery can be re-executed and return
+    /// rows already claimed, and the disjointness assertion fails.
+    #[tokio::test]
+    async fn it_polls_disjoint_messages_from_concurrent_transactions() {
+        let pool = &*test_pool().await;
+
+        const NUM_JOBS: usize = 4;
+        const BATCH_SIZE: i32 = 2;
+
+        let builders: Vec<_> = (0..NUM_JOBS)
+            .map(|_| JobBuilder::new("concurrent"))
+            .collect();
+        let spawned: HashSet<Uuid> = spawn_batch(pool, &builders)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        async fn poll_ids(tx: &mut sqlx::Transaction<'_, Postgres>, batch_size: i32) -> Vec<Uuid> {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM mq_poll($1, $2) WHERE id IS NOT NULL")
+                .bind(Option::<Vec<String>>::None)
+                .bind(batch_size)
+                .fetch_all(&mut **tx)
+                .await
+                .unwrap()
+        }
+
+        let mut tx_a = pool.begin().await.unwrap();
+        let mut tx_b = pool.begin().await.unwrap();
+
+        // `tx_a` claims a batch and holds the locks: it is not committed yet.
+        let claimed_a = poll_ids(&mut tx_a, BATCH_SIZE).await;
+        assert_eq!(claimed_a.len(), BATCH_SIZE as usize);
+
+        // `tx_b` must skip what `tx_a` holds rather than waiting for it.
+        let claimed_b =
+            tokio::time::timeout(Duration::from_secs(10), poll_ids(&mut tx_b, BATCH_SIZE))
+                .await
+                .expect("concurrent poll blocked on the first transaction's row locks");
+        assert_eq!(claimed_b.len(), BATCH_SIZE as usize);
+
+        tx_a.commit().await.unwrap();
+        tx_b.commit().await.unwrap();
+
+        let set_a: HashSet<Uuid> = claimed_a.iter().copied().collect();
+        let set_b: HashSet<Uuid> = claimed_b.iter().copied().collect();
+        assert_eq!(
+            set_a.len(),
+            claimed_a.len(),
+            "a poll returned duplicate ids"
+        );
+        assert_eq!(
+            set_b.len(),
+            claimed_b.len(),
+            "a poll returned duplicate ids"
+        );
+        assert!(
+            set_a.is_disjoint(&set_b),
+            "concurrent polls claimed overlapping messages: {:?} and {:?}",
+            set_a,
+            set_b
+        );
+        assert_eq!(
+            &set_a | &set_b,
+            spawned,
+            "the two polls together should have claimed every spawned job"
+        );
+    }
+
+    /// End-to-end counterpart to the test above: several independent job
+    /// runners sharing one database must between them deliver each job
+    /// exactly once, and must all make progress rather than deadlocking or
+    /// starving each other.
+    ///
+    /// Concurrency limits are kept low so that no single runner can drain the
+    /// queue in one batch, forcing the runners to contend for the same rows.
+    ///
+    /// Unlike the test above this one does not single out `SKIP LOCKED` — it
+    /// guards the delivery contract that the locking strategy exists to
+    /// uphold, and so stays valid if that strategy is changed again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn it_delivers_each_job_exactly_once_with_concurrent_runners() {
+        let pool = &*test_pool().await;
+
+        const NUM_RUNNERS: usize = 4;
+        const NUM_JOBS: usize = 24;
+        const NUM_CHANNELS: usize = 4;
+
+        let (tx, mut rx) = mpsc::unbounded();
+
+        let mut runners = Vec::new();
+        for runner_idx in 0..NUM_RUNNERS {
+            let tx = tx.clone();
+            let runner = JobRunnerOptions::new(pool, move |mut job| {
+                let tx = tx.clone();
+                task::spawn(async move {
+                    let id = job.id();
+                    job.complete().await.unwrap();
+                    tx.unbounded_send((runner_idx, id)).unwrap();
+                });
+            })
+            .set_concurrency(2, 6)
+            .run()
+            .await
+            .unwrap();
+            runners.push(runner);
+        }
+        // Drop the extra sender so the receiver terminates if every runner
+        // goes away.
+        drop(tx);
+
+        // Spread the jobs over several channels so that `mq_active_channels`
+        // is exercised as well as the per-channel batching.
+        let channel_args: Vec<String> = (0..NUM_JOBS)
+            .map(|i| (i % NUM_CHANNELS).to_string())
+            .collect();
+        let builders: Vec<_> = channel_args
+            .iter()
+            .map(|args| {
+                let mut builder = JobBuilder::new("concurrent");
+                builder.set_channel_args(args);
+                builder
+            })
+            .collect();
+        let spawned: HashSet<Uuid> = spawn_batch(pool, &builders)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(spawned.len(), NUM_JOBS);
+
+        let mut delivered = HashSet::new();
+        let mut delivering_runners = HashSet::new();
+        for _ in 0..NUM_JOBS {
+            let (runner_idx, id) = tokio::time::timeout(Duration::from_secs(60), rx.next())
+                .await
+                .expect("timed out waiting for jobs to be delivered")
+                .expect("all runners stopped before every job was delivered");
+            assert!(
+                delivered.insert(id),
+                "job {} was delivered more than once",
+                id
+            );
+            delivering_runners.insert(runner_idx);
+        }
+        assert_eq!(delivered, spawned);
+
+        // Anything already queued beyond the expected count is a redelivery.
+        assert!(rx.try_recv().is_err(), "a job was delivered more than once");
+
+        // Every job was completed, so the queue must be empty.
+        for id in &spawned {
+            assert!(
+                !exists(pool, *id).await.unwrap(),
+                "job {} was not deleted",
+                id
+            );
+        }
+
+        log::info!(
+            "{} of {} runners took part in delivery",
+            delivering_runners.len(),
+            NUM_RUNNERS
+        );
+
+        for mut runner in runners {
+            runner.stop().await;
+        }
     }
 }
