@@ -49,7 +49,7 @@ async fn start_job(
     pool: Pool<Postgres>,
     seed: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let channel_name = if seed % 3 == 0 { "foo" } else { "bar" };
+    let channel_name = if seed.is_multiple_of(3) { "foo" } else { "bar" };
     let channel_args = format!("{}", seed / 32);
     example_job
         .builder()
