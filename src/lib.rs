@@ -259,11 +259,131 @@ pub fn should_retry(error: &sqlx::Error) -> bool {
     }
 }
 
+/// Unit tests for [`should_retry`]. These do not require a database
+/// connection: the errors are constructed from a stub `DatabaseError`.
+#[cfg(test)]
+mod should_retry_tests {
+    use super::*;
+
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt::{self, Display};
+
+    use sqlx::error::{DatabaseError, ErrorKind};
+
+    #[derive(Debug)]
+    struct StubDbError {
+        code: Option<&'static str>,
+        constraint: Option<&'static str>,
+    }
+
+    impl Display for StubDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("stub database error")
+        }
+    }
+
+    impl StdError for StubDbError {}
+
+    impl DatabaseError for StubDbError {
+        fn message(&self) -> &str {
+            "stub database error"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.map(Cow::Borrowed)
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    fn db_error(code: Option<&'static str>, constraint: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(StubDbError { code, constraint }))
+    }
+
+    #[test]
+    fn retries_serialization_failure() {
+        assert!(should_retry(&db_error(Some("40001"), None)));
+    }
+
+    #[test]
+    fn retries_deadlock() {
+        assert!(should_retry(&db_error(Some("40P01"), None)));
+    }
+
+    /// Two ordered messages racing to chain onto the same predecessor.
+    #[test]
+    fn retries_ordered_channel_unique_violation() {
+        assert!(should_retry(&db_error(
+            Some("23505"),
+            Some("mq_msgs_channel_name_channel_args_after_message_id_idx"),
+        )));
+    }
+
+    /// The predecessor of an ordered message was deleted concurrently.
+    #[test]
+    fn retries_ordered_channel_foreign_key_violation() {
+        assert!(should_retry(&db_error(
+            Some("23503"),
+            Some("mq_msgs_after_message_id_fkey"),
+        )));
+    }
+
+    /// The constraint violations are only retryable on the ordered-channel
+    /// constraints: the same SQLSTATE raised by the caller's own schema means
+    /// a genuine conflict, and retrying would just raise it again.
+    #[test]
+    fn does_not_retry_constraint_violations_on_other_constraints() {
+        assert!(!should_retry(&db_error(
+            Some("23505"),
+            Some("users_email_key")
+        )));
+        assert!(!should_retry(&db_error(
+            Some("23503"),
+            Some("orders_user_id_fkey")
+        )));
+        assert!(!should_retry(&db_error(Some("23505"), None)));
+    }
+
+    #[test]
+    fn does_not_retry_other_database_errors() {
+        // Undefined table.
+        assert!(!should_retry(&db_error(Some("42P01"), None)));
+        // Syntax error.
+        assert!(!should_retry(&db_error(Some("42601"), None)));
+        assert!(!should_retry(&db_error(None, None)));
+    }
+
+    /// Non-database errors (connection loss, decoding failures, pool
+    /// timeouts) are not retryable by this helper.
+    #[test]
+    fn does_not_retry_non_database_errors() {
+        assert!(!should_retry(&sqlx::Error::PoolTimedOut));
+        assert!(!should_retry(&sqlx::Error::RowNotFound));
+        assert!(!should_retry(&sqlx::Error::Io(std::io::Error::other(
+            "connection reset"
+        ))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate as sqlxmq;
 
+    use std::collections::HashSet;
     use std::env;
     use std::error::Error;
     use std::future::Future;
