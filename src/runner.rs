@@ -512,3 +512,70 @@ async fn keep_job_alive(id: Uuid, pool: Pool<Postgres>, mut interval: Duration) 
         }
     }
 }
+
+/// Unit tests for the pure helpers in this module. These do not require a
+/// database connection.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interval(months: i32, days: i32, microseconds: i64) -> PgInterval {
+        PgInterval {
+            months,
+            days,
+            microseconds,
+        }
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    #[test]
+    fn to_duration_converts_zero() {
+        assert_eq!(to_duration(interval(0, 0, 0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn to_duration_converts_microseconds() {
+        assert_eq!(to_duration(interval(0, 0, 1)), Duration::from_micros(1));
+        assert_eq!(
+            to_duration(interval(0, 0, 1_500_000)),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn to_duration_converts_days() {
+        assert_eq!(to_duration(interval(0, 1, 0)), DAY);
+        assert_eq!(to_duration(interval(0, 3, 0)), 3 * DAY);
+    }
+
+    /// Postgres intervals do not carry an anchor date, so a month is treated
+    /// as exactly 30 days.
+    #[test]
+    fn to_duration_treats_a_month_as_thirty_days() {
+        assert_eq!(to_duration(interval(1, 0, 0)), 30 * DAY);
+        assert_eq!(to_duration(interval(2, 0, 0)), 60 * DAY);
+    }
+
+    #[test]
+    fn to_duration_sums_all_components() {
+        assert_eq!(
+            to_duration(interval(1, 2, 500_000)),
+            32 * DAY + Duration::from_millis(500)
+        );
+    }
+
+    /// `Duration` cannot represent negative values, so an interval that is
+    /// negative in any component collapses to zero. This matters because the
+    /// runner uses the result as a sleep duration: a message whose
+    /// `attempt_at` is already in the past must be polled immediately, not
+    /// waited on.
+    #[test]
+    fn to_duration_clamps_negative_components_to_zero() {
+        assert_eq!(to_duration(interval(0, 0, -1)), Duration::ZERO);
+        assert_eq!(to_duration(interval(0, -1, 0)), Duration::ZERO);
+        assert_eq!(to_duration(interval(-1, 0, 0)), Duration::ZERO);
+        // A negative component wins even when the total would be positive.
+        assert_eq!(to_duration(interval(1, 0, -1)), Duration::ZERO);
+    }
+}

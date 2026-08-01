@@ -13,6 +13,10 @@ runs:
         pg_isready
         sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password'"
 
-    - name: Setup database
+    # `#[sqlx::test]` gives each test its own database and applies the
+    # migrations to it, so this only has to exist for sqlx to connect to and
+    # keep its bookkeeping in. No migrations are run here, and sqlx-cli is not
+    # needed.
+    - name: Create database
       shell: bash
-      run: cargo sqlx database setup
+      run: sudo -u postgres createdb sqlxmq
